@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  rock-debugger:
+    build: .
+    container_name: rock-debugger 
+    privileged: true
+    devices:
+      - /dev/bus/usb:/dev/bus/usb
+    volumes:
+      - .:/workspace
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+    environment:
+      - DISPLAY=${DISPLAY}
+    ports:
+      - "1234:1234"
+    stdin_open: true
+    tty: true
+    command: /bin/bash
+    restart: unless-stopped
