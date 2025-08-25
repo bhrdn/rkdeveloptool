@@ -46,7 +46,12 @@ void CRKDevice::SetBcdUsb(USHORT value)
 }
 void CRKDevice::SetLayerName(char *value)
 {
-	strcpy(m_layerName,value);
+	if (value) {
+		strncpy(m_layerName, value, sizeof(m_layerName) - 1);
+		m_layerName[sizeof(m_layerName) - 1] = '\0';
+	} else {
+		m_layerName[0] = '\0';
+	}
 }
 void CRKDevice::SetLocationID(DWORD value)
 {
@@ -305,11 +310,13 @@ bool CRKDevice::GetFlashInfo()
 			}
 			return false;
 		}
-		if (info.bManufCode <= 7) {
-			strcpy(m_flashInfo.szManufacturerName, szManufName[info.bManufCode]);
-		} else {
-			strcpy(m_flashInfo.szManufacturerName, "UNKNOWN");
-		}
+			if (info.bManufCode <= 7) {
+		strncpy(m_flashInfo.szManufacturerName, szManufName[info.bManufCode], sizeof(m_flashInfo.szManufacturerName) - 1);
+		m_flashInfo.szManufacturerName[sizeof(m_flashInfo.szManufacturerName) - 1] = '\0';
+	} else {
+		strncpy(m_flashInfo.szManufacturerName, "UNKNOWN", sizeof(m_flashInfo.szManufacturerName) - 1);
+		m_flashInfo.szManufacturerName[sizeof(m_flashInfo.szManufacturerName) - 1] = '\0';
+	}
 		m_flashInfo.uiFlashSize = info.uiFlashSize / 2 / 1024;
 		m_flashInfo.uiPageSize = info.bPageSize / 2;
 		m_flashInfo.usBlockSize = info.usBlockSize / 2;

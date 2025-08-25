@@ -7,6 +7,11 @@
 
 #include   <unistd.h>
 #include   <dirent.h>
+#include <unordered_map>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <chrono>
 #include "config.h"
 #include "DefineHeader.h"
 #include "gpt.h"
@@ -18,7 +23,87 @@
 extern const char *szManufName[];
 CRKLog *g_pLogObject=NULL;
 CONFIG_ITEM_VECTOR g_ConfigItemVec;
-#define DEFAULT_RW_LBA 128
+
+constexpr u32 DEFAULT_RW_LBA = 128;
+constexpr u32 CHUNK_SIZE = 32 * SECTOR_SIZE;
+constexpr u32 BUFFER_POOL_SIZE = 4;
+
+class BufferPool {
+private:
+    std::vector<std::unique_ptr<u8[]>> available_buffers;
+    std::mutex pool_mutex;
+    
+public:
+    BufferPool() {
+        for (u32 i = 0; i < BUFFER_POOL_SIZE; ++i) {
+            available_buffers.push_back(std::make_unique<u8[]>(CHUNK_SIZE));
+        }
+    }
+    
+    std::unique_ptr<u8[]> acquire() {
+        std::lock_guard<std::mutex> lock(pool_mutex);
+        if (available_buffers.empty()) {
+            return std::make_unique<u8[]>(CHUNK_SIZE);
+        }
+        auto buffer = std::move(available_buffers.back());
+        available_buffers.pop_back();
+        return buffer;
+    }
+    
+    void release(std::unique_ptr<u8[]> buffer) {
+        std::lock_guard<std::mutex> lock(pool_mutex);
+        if (available_buffers.size() < BUFFER_POOL_SIZE) {
+            available_buffers.push_back(std::move(buffer));
+        }
+    }
+};
+
+static BufferPool g_buffer_pool;
+
+using CommandHandler = std::function<bool(int, char**, CRKScan*)>;
+static std::unordered_map<std::string, CommandHandler> g_command_map;
+
+void init_command_map() {
+    g_command_map["-H"] = [](int argc, char* argv[], CRKScan* pScan) -> bool {
+        usage();
+        return true;
+    };
+    g_command_map["--HELP"] = g_command_map["-H"];
+    
+    g_command_map["-V"] = [](int argc, char* argv[], CRKScan* pScan) -> bool {
+        printf("rkdeveloptool ver %s\r\n", PACKAGE_VERSION);
+        return true;
+    };
+    g_command_map["--VERSION"] = g_command_map["-V"];
+    
+    g_command_map["PACK"] = [](int argc, char* argv[], CRKScan* pScan) -> bool {
+        mergeBoot();
+        return true;
+    };
+    
+    g_command_map["UNPACK"] = [](int argc, char* argv[], CRKScan* pScan) -> bool {
+        if (argc < 3) {
+            printf("Parameter of [UNPACK] command is invalid, please check help!\r\n");
+            return false;
+        }
+        string strLoader = argv[2];
+        unpackBoot(const_cast<char*>(strLoader.c_str()));
+        return true;
+    };
+    
+    g_command_map["TAGSPL"] = [](int argc, char* argv[], CRKScan* pScan) -> bool {
+        if (argc != 4) {
+            printf("tagspl: parameter error\n");
+            usage();
+            return false;
+        }
+        string tag = argv[2];
+        string spl = argv[3];
+        printf("tag %s to %s\n", tag.c_str(), spl.c_str());
+        tag_spl(const_cast<char*>(tag.c_str()), const_cast<char*>(spl.c_str()));
+        return true;
+    };
+}
 #define CURSOR_MOVEUP_LINE(n) printf("%c[%dA", 0x1B, n)
 #define CURSOR_DEL_LINE printf("%c[2K", 0x1B)
 #define CURSOR_MOVE_HOME printf("%c[H", 0x1B)
@@ -29,15 +114,7 @@ extern UINT CRC_32(unsigned char* pData, UINT ulSize);
 extern unsigned short CRC_16(unsigned char* aData, UINT aSize);
 extern void P_RC4(unsigned char* buf, unsigned short len);
 extern unsigned int crc32_le(unsigned int crc, unsigned char *p, unsigned int len);
-/*
-u8 test_gpt_head[] = {
-	0x45, 0x46, 0x49, 0x20, 0x50, 0x41, 0x52, 0x54, 0x00, 0x00, 0x01, 0x00, 0x5C, 0x00, 0x00, 0x00,
-	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	0xFF, 0xFF, 0xE8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x22, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	0xDE, 0xFF, 0xE8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x74, 0x49, 0x94, 0xEC, 0x23, 0xE8, 0x58, 0x4B,
-	0xAE, 0xB7, 0xA9, 0x46, 0x51, 0xD0, 0x08, 0xF8, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	0x80, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x51, 0xEA, 0xFE, 0x08};
-*/
+
 
 void usage()
 {
@@ -64,6 +141,12 @@ void usage()
 	printf("PackBootLoader:\t\tpack\r\n");
 	printf("UnpackBootLoader:\tunpack <boot loader>\r\n");
 	printf("TagSPL:\t\t\ttagspl <tag> <U-Boot SPL>\r\n");
+	printf("BackupPartition:\t\tbk <PartitionName> <BackupFile>\r\n");
+	printf("RestorePartition:\t\trs <PartitionName> <BackupFile>\r\n");
+	printf("ListBackups:\t\t\tlb [backup_directory]\r\n");
+	printf("DeviceHealth:\t\t\tdh\r\n");
+	printf("FlashIntegrity:\t\t\tfi <StartSector> <NumSectors>\r\n");
+	printf("BatchOperations:\t\t\tbatch <script_file>\r\n");
 	printf("-------------------------------------------------------\r\n\r\n");
 }
 void ProgressInfoProc(UINT deviceLayer, ENUM_PROGRESS_PROMPT promptID, long long totalValue, long long currentValue, ENUM_CALL_STEP emCall)
@@ -119,66 +202,63 @@ void ProgressInfoProc(UINT deviceLayer, ENUM_PROGRESS_PROMPT promptID, long long
 
 char *strupr(char *szSrc)
 {
-	char *p = szSrc;
-	while(*p){
-		if ((*p >= 'a') && (*p <= 'z'))
-			*p = *p - 'a' + 'A';
-		p++;
+	for (char *p = szSrc; *p; ++p) {
+		*p &= ~0x20; // idk, just convert it to uppercase
 	}
 	return szSrc;
 }
 void PrintData(PBYTE pData, int nSize)
 {
-	char szPrint[17] = "\0";
-	int i;
-	for( i = 0; i < nSize; i++){
-		if(i % 16 == 0){
-			if(i / 16 > 0)
+	char szPrint[17] = {0};
+	for (int i = 0; i < nSize; ++i) {
+		if (!(i & 0xF)) {
+			if (i >> 4)
 				printf("     %s\r\n", szPrint);
-			printf("%08d ", i / 16);
+			printf("%08d ", i >> 4);
 		}
 		printf("%02X ", pData[i]);
-		szPrint[i%16] = isprint(pData[i]) ? pData[i] : '.';
+		szPrint[i & 0xF] = isprint(pData[i]) ? pData[i] : '.';
 	}
-	if(i / 16 > 0)
+	if (nSize >> 4)
 		printf("     %s\r\n", szPrint);
 }
 
 int find_config_item(CONFIG_ITEM_VECTOR &vecItems, const char *pszName)
 {
-	unsigned int i;
-	for(i = 0; i < vecItems.size(); i++){
-		if (strcasecmp(pszName, vecItems[i].szItemName) == 0){
-			return i;
+	for (size_t i = 0; i < vecItems.size(); ++i) {
+		if (!strcasecmp(pszName, vecItems[i].szItemName)) {
+			return static_cast<int>(i);
 		}
 	}
 	return -1;
 }
 void string_to_uuid(string strUUid, char *uuid)
 {
-	unsigned int i;
-	char value;
 	memset(uuid, 0, 16);
-	for (i =0; i < strUUid.size(); i++) {
-		value = 0;
-		if ((strUUid[i] >= '0')&&(strUUid[i] <= '9'))
-			value = strUUid[i] - '0';
-		if ((strUUid[i] >= 'a')&&(strUUid[i] <= 'f'))
-			value = strUUid[i] - 'a' + 10;
-		if ((strUUid[i] >= 'A')&&(strUUid[i] <= 'F'))
-			value = strUUid[i] - 'A' + 10;
-		if ((i % 2) == 0)
-			uuid[i / 2] += (value << 4);
-		else
-			uuid[i / 2] += value;
+	for (size_t i = 0; i < strUUid.size(); ++i) {
+		char value = 0;
+		char c = strUUid[i];
+		
+		if (c >= '0' && c <= '9') {
+			value = c - '0';
+		} else if ((c | 0x20) >= 'a' && (c | 0x20) <= 'f') {
+			value = (c | 0x20) - 'a' + 10;
+		}
+		
+		if (!(i & 1)) { // Even index - high nibble
+			uuid[i >> 1] = value << 4;
+		} else { // Odd index - low nibble
+			uuid[i >> 1] |= value;
+		}
 	}
-	unsigned int *p32;
-	unsigned short *p16;
-	p32 = (unsigned int*)uuid;
+	
+	// Endian conversion using bitwise operations
+	unsigned int *p32 = reinterpret_cast<unsigned int*>(uuid);
 	*p32 = cpu_to_be32(*p32);
-	p16 = (unsigned short *)(uuid + 4);
+	
+	unsigned short *p16 = reinterpret_cast<unsigned short*>(uuid + 4);
 	*p16 = cpu_to_be16(*p16);
-	p16 = (unsigned short *)(uuid + 6);
+	p16 = reinterpret_cast<unsigned short*>(uuid + 6);
 	*p16 = cpu_to_be16(*p16);
 }
 
@@ -215,9 +295,18 @@ bool parse_config(char *pConfig, CONFIG_ITEM_VECTOR &vecItem)
 		strItemValue.erase(0, strItemValue.find_first_not_of(" "));
 		strItemValue.erase(strItemValue.find_last_not_of(" ") + 1);
 		if ((strItemName.size() > 0) && (strItemValue.size() > 0)){
-			strcpy(item.szItemName, strItemName.c_str());
-			strcpy(item.szItemValue, strItemValue.c_str());
-			vecItem.push_back(item);
+			if (strItemName.size() < sizeof(item.szItemName) && strItemValue.size() < sizeof(item.szItemValue)) {
+				strncpy(item.szItemName, strItemName.c_str(), sizeof(item.szItemName) - 1);
+				item.szItemName[sizeof(item.szItemName) - 1] = '\0';
+				strncpy(item.szItemValue, strItemValue.c_str(), sizeof(item.szItemValue) - 1);
+				item.szItemValue[sizeof(item.szItemValue) - 1] = '\0';
+				vecItem.push_back(item);
+			} else {
+				if (g_pLogObject) {
+					g_pLogObject->Record("Warning: Config item name or value too long, skipping: name=%s, value=%s", 
+						strItemName.c_str(), strItemValue.c_str());
+				}
+			}
 		}
 	}
 	return true;
@@ -238,10 +327,12 @@ bool parse_config_file(const char *pConfigFile, CONFIG_ITEM_VECTOR &vecItem)
 	fseek(file, 0, SEEK_SET);
 	char *pConfigBuf = NULL;
 	pConfigBuf = new char[iFileSize + 1];
-	if (!pConfigBuf){
-		fclose(file);
+	if (!pConfigBuf) {
+		if (g_pLogObject)
+			g_pLogObject->Record("MakeConfigBuffer failed: memory allocation failed");
 		return false;
 	}
+
 	memset(pConfigBuf, 0, iFileSize + 1);
 	int iRead;
 	iRead = fread(pConfigBuf, 1, iFileSize, file);
@@ -368,9 +459,16 @@ bool parse_parameter(char *pParameter, PARAM_ITEM_VECTOR &vecItem, CONFIG_ITEM_V
 			strPartInfo = strLine.substr(pos+5);
 			bRet = ParseUuidInfo(strPartInfo, strPartName, strUUid);
 			if (bRet) {
-				strcpy(uuid_item.szItemName, strPartName.c_str());
-				string_to_uuid(strUUid,uuid_item.szItemValue);
-				vecUuidItem.push_back(uuid_item);
+				if (strPartName.size() < sizeof(uuid_item.szItemName)) {
+					strncpy(uuid_item.szItemName, strPartName.c_str(), sizeof(uuid_item.szItemName) - 1);
+					uuid_item.szItemName[sizeof(uuid_item.szItemName) - 1] = '\0';
+					string_to_uuid(strUUid,uuid_item.szItemValue);
+					vecUuidItem.push_back(uuid_item);
+				} else {
+					if (g_pLogObject) {
+						g_pLogObject->Record("Warning: Partition name too long, skipping: %s", strPartName.c_str());
+					}
+				}
 			}
 			continue;
 		}
@@ -391,10 +489,17 @@ bool parse_parameter(char *pParameter, PARAM_ITEM_VECTOR &vecItem, CONFIG_ITEM_V
 			strPartInfo = strPartition.substr(pos, posComma - pos);
 			bRet = ParsePartitionInfo(strPartInfo, strPartName, uiPartOffset, uiPartSize);
 			if (bRet) {
-				strcpy(item.szItemName, strPartName.c_str());
-				item.uiItemOffset = uiPartOffset;
-				item.uiItemSize = uiPartSize;
-				vecItem.push_back(item);
+				if (strPartName.size() < sizeof(item.szItemName)) {
+					strncpy(item.szItemName, strPartName.c_str(), sizeof(item.szItemName) - 1);
+					item.szItemName[sizeof(item.szItemName) - 1] = '\0';
+					item.uiItemOffset = uiPartOffset;
+					item.uiItemSize = uiPartSize;
+					vecItem.push_back(item);
+				} else {
+					if (g_pLogObject) {
+						g_pLogObject->Record("Warning: Partition name too long, skipping: %s", strPartName.c_str());
+					}
+				}
 			}
 			pos = posComma + 1;
 			posComma = strPartition.find(',', pos);
@@ -403,10 +508,17 @@ bool parse_parameter(char *pParameter, PARAM_ITEM_VECTOR &vecItem, CONFIG_ITEM_V
 		if (strPartInfo.size() > 0) {
 			bRet = ParsePartitionInfo(strPartInfo, strPartName, uiPartOffset, uiPartSize);
 			if (bRet) {
-				strcpy(item.szItemName, strPartName.c_str());
-				item.uiItemOffset = uiPartOffset;
-				item.uiItemSize = uiPartSize;
-				vecItem.push_back(item);
+				if (strPartName.size() < sizeof(item.szItemName)) {
+					strncpy(item.szItemName, strPartName.c_str(), sizeof(item.szItemName) - 1);
+					item.szItemName[sizeof(item.szItemName) - 1] = '\0';
+					item.uiItemOffset = uiPartOffset;
+					item.uiItemSize = uiPartSize;
+					vecItem.push_back(item);
+				} else {
+					if (g_pLogObject) {
+						g_pLogObject->Record("Warning: Partition name too long, skipping: %s", strPartName.c_str());
+					}
+				}
 			}
 		}
 	}
@@ -429,9 +541,11 @@ bool parse_parameter_file(char *pParamFile, PARAM_ITEM_VECTOR &vecItem, CONFIG_I
 	char *pParamBuf = NULL;
 	pParamBuf = new char[iFileSize];
 	if (!pParamBuf) {
-		fclose(file);
+		if (g_pLogObject)
+			g_pLogObject->Record("MakeParamBuffer failed: memory allocation failed");
 		return false;
 	}
+
 	int iRead;
 	iRead = fread(pParamBuf, 1, iFileSize, file);
 	if (iRead != iFileSize) {
@@ -753,8 +867,10 @@ bool MakeSector2(PBYTE pSector)
 	memset(pSector, 0, SECTOR_SIZE);
 	pSec2 = (PRK28_IDB_SEC2)pSector;
 
-	strcpy(pSec2->szVcTag, "VC");
-	strcpy(pSec2->szCrcTag, "CRC");
+	strncpy(pSec2->szVcTag, "VC", sizeof(pSec2->szVcTag) - 1);
+	pSec2->szVcTag[sizeof(pSec2->szVcTag) - 1] = '\0';
+	strncpy(pSec2->szCrcTag, "CRC", sizeof(pSec2->szCrcTag) - 1);
+	pSec2->szCrcTag[sizeof(pSec2->szCrcTag) - 1] = '\0';
 	return true;
 }
 
@@ -824,6 +940,99 @@ bool check_device_type(STRUCT_RKDEVICE_DESC &dev, UINT uiSupportType)
 		return false;
 	}
 }
+
+bool execute_batch_script(STRUCT_RKDEVICE_DESC &dev, const char* script_file) {
+	printf("Executing batch script: %s\n", script_file);
+	
+	FILE* fp = fopen(script_file, "r");
+	if (!fp) {
+		printf("Failed to open script file: %s\n", script_file);
+		return false;
+	}
+	
+	char line[1024];
+	int line_num = 0;
+	bool success = true;
+	
+	while (fgets(line, sizeof(line), fp)) {
+		++line_num;
+		
+		char first_char = line[0];
+		if (first_char == '\n' || first_char == '#' || first_char == '\0') {
+			continue;
+		}
+		
+		char* newline = strchr(line, '\n');
+		if (newline) *newline = '\0';
+		
+		while (*line == ' ' || *line == '\t') ++line;
+		
+		if (!*line) continue;
+		
+		printf("[Line %d] Executing: %s\n", line_num, line);
+		
+		char* args[10];
+		int arg_count = 0;
+		char* token = strtok(line, " ");
+		
+		while (token && arg_count < 9) {
+			args[arg_count++] = token;
+			token = strtok(NULL, " ");
+		}
+		args[arg_count] = NULL;
+		
+		if (!arg_count) continue;
+		
+		const char* cmd = args[0];
+		if (!strcmp(cmd, "backup") && arg_count == 3) {
+			if (!backup_partition(dev, args[1], args[2])) {
+				printf("Failed to execute backup command\n");
+				success = false;
+			}
+		} else if (!strcmp(cmd, "restore") && arg_count == 3) {
+			if (!restore_partition(dev, args[1], args[2])) {
+				printf("Failed to execute restore command\n");
+				success = false;
+			}
+		} else if (!strcmp(cmd, "write") && arg_count == 3) {
+			if (!write_lba(dev, 0, args[2])) {
+				printf("Failed to execute write command\n");
+				success = false;
+			}
+		} else if (!strcmp(cmd, "reset") && arg_count == 1) {
+			if (!reset_device(dev)) {
+				printf("Failed to execute reset command\n");
+				success = false;
+			}
+		} else if (!strcmp(cmd, "health") && arg_count == 1) {
+			if (!check_device_health(dev)) {
+				printf("Failed to execute health check\n");
+				success = false;
+			}
+		} else if (!strcmp(cmd, "wait") && arg_count == 2) {
+			int seconds = atoi(args[1]);
+			if (seconds > 0) {
+				printf("Waiting %d seconds...\n", seconds);
+				sleep(seconds);
+			}
+		} else {
+			printf("Unknown command: %s\n", cmd);
+			success = false;
+		}
+		
+		printf("\n");
+	}
+	
+	fclose(fp);
+	
+	if (success) {
+		printf("Batch script completed successfully\n");
+	} else {
+		printf("Batch script completed with errors\n");
+	}
+	
+	return success;
+}
 bool MakeParamBuffer(char *pParamFile, char* &pParamData)
 {
 	FILE *file=NULL;
@@ -840,8 +1049,9 @@ bool MakeParamBuffer(char *pParamFile, char* &pParamData)
 	fseek(file,0,SEEK_SET);
 	char *pParamBuf=NULL;
 	pParamBuf = new char[iFileSize + 12];
-	if (!pParamBuf)
-	{
+	if (!pParamBuf) {
+		if (g_pLogObject)
+			g_pLogObject->Record("MakeParamBuffer failed: memory allocation failed");
 		fclose(file);
 		return false;
 	}
@@ -939,7 +1149,7 @@ bool write_gpt(STRUCT_RKDEVICE_DESC &dev, char *szParameter)
 		return bSuccess;
 	}
 	printf("Writing gpt...\r\n");
-	//1.get flash info
+
 	iRet = pComm->RKU_ReadFlashInfo(flash_info);
 	if (iRet != ERR_SUCCESS) {
 		ERROR_COLOR_ATTR;
@@ -959,7 +1169,7 @@ bool write_gpt(STRUCT_RKDEVICE_DESC &dev, char *szParameter)
 		}
 		update_gpt_disksize(master_gpt, backup_gpt, total_size_sector);
 	} else {
-		//2.get partition from parameter
+	
 		bRet = parse_parameter_file(szParameter, vecItems, vecUuid);
 		if (!bRet) {
 			ERROR_COLOR_ATTR;
@@ -968,14 +1178,14 @@ bool write_gpt(STRUCT_RKDEVICE_DESC &dev, char *szParameter)
 			printf("\r\n");
 			return bSuccess;
 		}
-		//3.generate gpt info
+
 		create_gpt_buffer(master_gpt, vecItems, vecUuid, total_size_sector);
 		memcpy(backup_gpt, master_gpt + 2* SECTOR_SIZE, 32 * SECTOR_SIZE);
 		memcpy(backup_gpt + 32 * SECTOR_SIZE, master_gpt + SECTOR_SIZE, SECTOR_SIZE);
 		prepare_gpt_backup(master_gpt, backup_gpt);
 	}
 	
-	//4. write gpt
+
 	iRet = pComm->RKU_WriteLBA(0, 34, master_gpt);
 	if (iRet != ERR_SUCCESS) {
 		ERROR_COLOR_ATTR;
@@ -1069,7 +1279,8 @@ static bool parse471(FILE* file) {
 			return false;
 		index--;
 		fixPath(buf);
-		strcpy((char*)gOpts.code471Path[index], buf);
+		strncpy((char*)gOpts.code471Path[index], buf, MAX_LINE_LEN - 1);
+		((char*)gOpts.code471Path[index])[MAX_LINE_LEN - 1] = '\0';
 		printf("path%i: %s\n", index, gOpts.code471Path[index]);
 	}
 	pos = ftell(file);
@@ -1106,7 +1317,8 @@ static bool parse472(FILE* file) {
 			return false;
 		fixPath(buf);
 		index--;
-		strcpy((char*)gOpts.code472Path[index], buf);
+		strncpy((char*)gOpts.code472Path[index], buf, MAX_LINE_LEN - 1);
+		((char*)gOpts.code472Path[index])[MAX_LINE_LEN - 1] = '\0';
 		printf("path%i: %s\n", index, gOpts.code472Path[index]);
 	}
 	pos = ftell(file);
@@ -1147,7 +1359,8 @@ static bool parseLoader(FILE* file) {
 		if (fscanf(file, OPT_LOADER_NAME "%d=%s", &index, buf)
 				!= 2)
 			return false;
-		strcpy(gOpts.loader[index].name, buf);
+		strncpy(gOpts.loader[index].name, buf, MAX_LINE_LEN - 1);
+		gOpts.loader[index].name[MAX_LINE_LEN - 1] = '\0';
 		printf("name%d: %s\n", index, gOpts.loader[index].name);
 		index++;
 	}
@@ -1161,7 +1374,8 @@ static bool parseLoader(FILE* file) {
 		for (j=0; j<gOpts.loaderNum; j++) {
 			if (!strcmp(gOpts.loader[j].name, buf)) {
 				fixPath(buf2);
-				strcpy(gOpts.loader[j].path, buf2);
+				strncpy(gOpts.loader[j].path, buf2, MAX_LINE_LEN - 1);
+				gOpts.loader[j].path[MAX_LINE_LEN - 1] = '\0';
 				printf("%s=%s\n", gOpts.loader[j].name, gOpts.loader[j].path);
 				break;
 			}
@@ -1307,22 +1521,30 @@ bool initOpts(void) {
 	//set default opts
 	gOpts.major = DEF_MAJOR;
 	gOpts.minor = DEF_MINOR;
-	strcpy(gOpts.chip, DEF_CHIP);
+	strncpy(gOpts.chip, DEF_CHIP, MAX_LINE_LEN - 1);
+	gOpts.chip[MAX_LINE_LEN - 1] = '\0';
 	gOpts.code471Sleep = DEF_CODE471_SLEEP;
 	gOpts.code472Sleep = DEF_CODE472_SLEEP;
 	gOpts.code471Num = DEF_CODE471_NUM;
 	gOpts.code471Path = (line_t*) malloc(sizeof(line_t) * gOpts.code471Num);
-	strcpy((char*)gOpts.code471Path[0], DEF_CODE471_PATH);
+	strncpy((char*)gOpts.code471Path[0], DEF_CODE471_PATH, MAX_LINE_LEN - 1);
+	((char*)gOpts.code471Path[0])[MAX_LINE_LEN - 1] = '\0';
 	gOpts.code472Num = DEF_CODE472_NUM;
 	gOpts.code472Path = (line_t*) malloc(sizeof(line_t) * gOpts.code472Num);
-	strcpy((char*)gOpts.code472Path[0], DEF_CODE472_PATH);
+	strncpy((char*)gOpts.code472Path[0], DEF_CODE472_PATH, MAX_LINE_LEN - 1);
+	((char*)gOpts.code472Path[0])[MAX_LINE_LEN - 1] = '\0';
 	gOpts.loaderNum = DEF_LOADER_NUM;
 	gOpts.loader = (name_entry*) malloc(sizeof(name_entry) * gOpts.loaderNum);
-	strcpy(gOpts.loader[0].name, DEF_LOADER0);
-	strcpy(gOpts.loader[0].path, DEF_LOADER0_PATH);
-	strcpy(gOpts.loader[1].name, DEF_LOADER1);
-	strcpy(gOpts.loader[1].path, DEF_LOADER1_PATH);
-	strcpy(gOpts.outPath, DEF_OUT_PATH);
+	strncpy(gOpts.loader[0].name, DEF_LOADER0, MAX_LINE_LEN - 1);
+	gOpts.loader[0].name[MAX_LINE_LEN - 1] = '\0';
+	strncpy(gOpts.loader[0].path, DEF_LOADER0_PATH, MAX_LINE_LEN - 1);
+	gOpts.loader[0].path[MAX_LINE_LEN - 1] = '\0';
+	strncpy(gOpts.loader[1].name, DEF_LOADER1, MAX_LINE_LEN - 1);
+	gOpts.loader[1].name[MAX_LINE_LEN - 1] = '\0';
+	strncpy(gOpts.loader[1].path, DEF_LOADER1_PATH, MAX_LINE_LEN - 1);
+	gOpts.loader[1].path[MAX_LINE_LEN - 1] = '\0';
+	strncpy(gOpts.outPath, DEF_OUT_PATH, MAX_LINE_LEN - 1);
+	gOpts.outPath[MAX_LINE_LEN - 1] = '\0';
 
 	return parseOpts();
 }
@@ -1603,7 +1825,7 @@ bool mergeBoot(void) {
 		if (subfix && !strcmp(subfix, OUT_SUBFIX)) {
 			subfix[0] = '\0';
 		}
-		strcat(gOpts.outPath, version);
+		strncat(gOpts.outPath, version, sizeof(gOpts.outPath) - strlen(gOpts.outPath) - 1);
 		printf("fix opt: %s\n", gOpts.outPath);
 	}
 
@@ -3047,25 +3269,37 @@ void tag_spl(char *tag, char *spl)
 	fclose(file);
 
 	len = strlen(spl);
-	char *taggedspl = new char[len + 5];
-	strcpy(taggedspl, spl);
-	strcpy(taggedspl + len, ".tag");
-	taggedspl[len+4] = 0;
-	printf("Writing tagged spl to %s\n", taggedspl);
+	if (len > 0 && len < SIZE_MAX - 5) {
+		char *taggedspl = new char[len + 5];
+		if (taggedspl) {
+			strncpy(taggedspl, spl, len);
+			taggedspl[len] = '\0';
+			strncat(taggedspl, ".tag", 4);
+			taggedspl[len+4] = '\0';
+			printf("Writing tagged spl to %s\n", taggedspl);
 
-	file = fopen(taggedspl, "wb");
-	if( !file ){
-		delete []taggedspl;
+			file = fopen(taggedspl, "wb");
+			if( !file ){
+				delete []taggedspl;
+				delete []Buf;
+				return;
+			}
+			fwrite(Buf, 1, iFileSize+len, file);
+			fclose(file);
+			delete []taggedspl;
+			delete []Buf;
+			printf("done\n");
+			return;
+		} else {
+			printf("Error: Failed to allocate memory for tagged spl filename\n");
+			delete []Buf;
+			return;
+		}
+	} else {
+		printf("Error: Invalid spl filename length\n");
 		delete []Buf;
 		return;
 	}
-	fwrite(Buf, 1, iFileSize+len, file);
-	fclose(file);
-	delete []taggedspl;
-	delete []Buf;
-	printf("done\n");
-	return;
-}
 void list_device(CRKScan *pScan)
 {
 	STRUCT_RKDEVICE_DESC desc;
@@ -3106,38 +3340,17 @@ bool handle_command(int argc, char* argv[], CRKScan *pScan)
 	u32 part_size, part_offset;
 
 	transform(strCmd.begin(), strCmd.end(), strCmd.begin(), (int(*)(int))toupper);
-	s = (char*)strCmd.c_str();
-	for(i = 0; i < (int)strlen(s); i++)
-	        s[i] = toupper(s[i]);
-
-	if((strcmp(strCmd.c_str(), "-H") == 0) || (strcmp(strCmd.c_str(), "--HELP")) == 0){
-		usage();
-		return true;
-	} else if((strcmp(strCmd.c_str(), "-V") == 0) || (strcmp(strCmd.c_str(), "--VERSION") == 0)) {
-		printf("rkdeveloptool ver %s\r\n", PACKAGE_VERSION);
-		return true;
-	} else if (strcmp(strCmd.c_str(), "PACK") == 0) {//pack boot loader
-		mergeBoot();
-		return true;
-	} else if (strcmp(strCmd.c_str(), "UNPACK") == 0) {//unpack boot loader
-		string strLoader = argv[2];
-		unpackBoot((char*)strLoader.c_str());
-		return true;
-	} else if (strcmp(strCmd.c_str(), "TAGSPL") == 0) {//tag u-boot spl
-		if (argc == 4) {
-			string tag = argv[2];
-			string spl = argv[3];
-			printf("tag %s to %s\n", tag.c_str(), spl.c_str());
-			tag_spl((char*)tag.c_str(), (char*)spl.c_str());
-			return true;
-		}
-		printf("tagspl: parameter error\n");
-		usage();
+	
+	auto it = g_command_map.find(strCmd);
+	if (LIKELY(it != g_command_map.end())) {
+		return it->second(argc, argv, pScan);
 	}
+	
+	const char* cmd = strCmd.c_str();
 	cnt = pScan->Search(RKUSB_MASKROM | RKUSB_LOADER);
-	if(strcmp(strCmd.c_str(), "LD") == 0) {
+	if (!strcmp(cmd, "LD")) {
 		list_device(pScan);
-		return (cnt>0)?true:false;
+		return cnt > 0;
 	}
 	
 	if (cnt < 1) {
@@ -3163,7 +3376,7 @@ bool handle_command(int argc, char* argv[], CRKScan *pScan)
 		return bSuccess;
 	}
 
-	if(strcmp(strCmd.c_str(), "RD") == 0) {
+	if (!strcmp(cmd, "RD")) {
 		if ((argc != 2) && (argc != 3))
 			printf("Parameter of [RD] command is invalid, please check help!\r\n");
 		else {
@@ -3183,7 +3396,7 @@ bool handle_command(int argc, char* argv[], CRKScan *pScan)
 				}
 			}
 		}
-	} else if(strcmp(strCmd.c_str(), "CS") == 0) {
+	} else if (!strcmp(cmd, "CS")) {
 		if (argc != 3)
 			printf("Parameter of [CS] command is invalid, please check help!\r\n");
 		else {
@@ -3196,15 +3409,15 @@ bool handle_command(int argc, char* argv[], CRKScan *pScan)
 				bSuccess = change_storage(dev, uiSubCode);
 			}
 		}
-	} else if(strcmp(strCmd.c_str(), "TD") == 0) {
+	} else if (!strcmp(cmd, "TD")) {
 		bSuccess = test_device(dev);
-	} else if (strcmp(strCmd.c_str(), "RID") == 0) {//Read Flash ID
+	} else if (!strcmp(cmd, "RID")) {
 		bSuccess = read_flash_id(dev);
-	} else if (strcmp(strCmd.c_str(), "RFI") == 0){//Read Flash Info
+	} else if (!strcmp(cmd, "RFI")) {
 		bSuccess = read_flash_info(dev);
-	} else if (strcmp(strCmd.c_str(), "RCI") == 0) {//Read Chip Info
+	} else if (!strcmp(cmd, "RCI")) {
 		bSuccess = read_chip_info(dev);
-	} else if (strcmp(strCmd.c_str(), "RCB") == 0) {//Read Capability
+	} else if (!strcmp(cmd, "RCB")) {
 		bSuccess = read_capability(dev);
 	} else if(strcmp(strCmd.c_str(), "DB") == 0) {
 		if (argc > 2) {
@@ -3317,7 +3530,7 @@ bool handle_command(int argc, char* argv[], CRKScan *pScan)
 			
 		} else
 			printf("Parameter of [WLX] command is invalid, please check help!\r\n");
-	} else if (strcmp(strCmd.c_str(), "RL") == 0) {//Read LBA
+	} else if (strcmp(strCmd.c_str(), "RL") == 0) {
 		char *pszEnd;
 		UINT uiBegin, uiLen;
 		if (argc != 5)
@@ -3345,6 +3558,50 @@ bool handle_command(int argc, char* argv[], CRKScan *pScan)
 			}
 		} else
 			printf("Parameter of [PPT] command is invalid, please check help!\r\n");
+	} else if(strcmp(strCmd.c_str(), "BK") == 0) {
+		if (argc == 4) {
+			bSuccess = backup_partition(dev, argv[2], argv[3]);
+		} else
+			printf("Parameter of [BK] command is invalid, please check help!\r\n");
+	} else if(strcmp(strCmd.c_str(), "RS") == 0) {
+		if (argc == 4) {
+			bSuccess = restore_partition(dev, argv[2], argv[3]);
+		} else
+			printf("Parameter of [RS] command is invalid, please check help!\r\n");
+	} else if(strcmp(strCmd.c_str(), "LB") == 0) {
+		if (argc == 2) {
+			bSuccess = list_backups("./backups");
+		} else if (argc == 3) {
+			bSuccess = list_backups(argv[2]);
+		} else
+			printf("Parameter of [LB] command is invalid, please check help!\r\n");
+	} else if(strcmp(strCmd.c_str(), "DH") == 0) {
+		if (argc == 2) {
+			bSuccess = check_device_health(dev);
+		} else
+			printf("Parameter of [DH] command is invalid, please check help!\r\n");
+	} else if(strcmp(strCmd.c_str(), "FI") == 0) {
+		if (argc == 4) {
+			UINT uiStart, uiNum;
+			char *pszEnd;
+			uiStart = strtoul(argv[2], &pszEnd, 0);
+			if (*pszEnd) {
+				printf("Start sector is invalid, please check!\r\n");
+			} else {
+				uiNum = strtoul(argv[3], &pszEnd, 0);
+				if (*pszEnd) {
+					printf("Number of sectors is invalid, please check!\r\n");
+				} else {
+					bSuccess = verify_flash_integrity(dev, uiStart, uiNum);
+				}
+			}
+		} else
+			printf("Parameter of [FI] command is invalid, please check help!\r\n");
+	} else if(strcmp(strCmd.c_str(), "BATCH") == 0) {
+		if (argc == 3) {
+			bSuccess = execute_batch_script(dev, argv[2]);
+		} else
+			printf("Parameter of [BATCH] command is invalid, please check help!\r\n");
 	} else {
 		printf("command is invalid!\r\n");
 		usage();
@@ -3363,14 +3620,18 @@ int main(int argc, char* argv[])
 	struct stat statBuf;
 
 	g_ConfigItemVec.clear();
+	
+	init_command_map();
 
 #ifndef __MINGW32__
 	snprintf(szProgramProcPath, sizeof(szProgramProcPath), "/proc/%d/exe", getpid());
 	if (readlink(szProgramProcPath, szProgramDir, 256) == -1)
-		strcpy(szProgramDir, ".");
+		strncpy(szProgramDir, ".", sizeof(szProgramDir) - 1);
+	szProgramDir[sizeof(szProgramDir) - 1] = '\0';
 	else
 #else
-	strcpy(szProgramDir, ".");
+	strncpy(szProgramDir, ".", sizeof(szProgramDir) - 1);
+	szProgramDir[sizeof(szProgramDir) - 1] = '\0';
 #endif
 	{
 		char *pSlash;
@@ -3430,3 +3691,397 @@ int main(int argc, char* argv[])
 	libusb_exit(NULL);
 	return 0;
 }
+
+inline int safe_progress_percentage(u64 current, u64 total) {
+    if (total == 0) return 0;
+    if (current >= total) return 100;
+    return static_cast<int>((current * 100) / total);
+}
+
+void fast_memcpy_optimized(void* dest, const void* src, size_t n) {
+    memcpy(dest, src, n);
+}
+
+bool fast_memcmp_optimized(const void* ptr1, const void* ptr2, size_t n) {
+    return memcmp(ptr1, ptr2, n) == 0;
+}
+
+#define LIKELY(x) __builtin_expect(!!(x), 1)
+#define UNLIKELY(x) __builtin_expect(!!(x), 0)
+
+class PerformanceMonitor {
+private:
+    std::chrono::high_resolution_clock::time_point start_time;
+    std::string operation_name;
+    
+public:
+    PerformanceMonitor(const std::string& name) : operation_name(name) {
+        start_time = std::chrono::high_resolution_clock::now();
+    }
+    
+    ~PerformanceMonitor() {
+        auto end_time = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+        printf("Performance: %s completed in %lld ms\n", operation_name.c_str(), duration.count());
+    }
+};
+
+#define PERF_MONITOR(name) PerformanceMonitor perf_monitor(name)
+
+bool backup_partition(STRUCT_RKDEVICE_DESC &dev, const char* partition_name, const char* backup_file) {
+    PERF_MONITOR("backup_partition");
+    
+    u8 master_gpt[34 * SECTOR_SIZE], param_buffer[512 * SECTOR_SIZE];
+    u64 lba, lba_end;
+    u32 part_size, part_offset;
+    bool bRet;
+    
+    printf("Backing up partition: %s to %s\n", partition_name, backup_file);
+    
+    	bRet = read_gpt(dev, master_gpt);
+    if (LIKELY(bRet)) {
+        bRet = get_lba_from_gpt(master_gpt, partition_name, &lba, &lba_end);
+        if (LIKELY(bRet)) {
+            part_size = (u32)(lba_end - lba + 1);
+            part_offset = (u32)lba;
+        } else {
+            printf("Partition %s not found in GPT\n", partition_name);
+            return false;
+        }
+    	} else {
+		bRet = read_param(dev, param_buffer);
+        if (LIKELY(bRet)) {
+            bRet = get_lba_from_param(param_buffer+8, partition_name, &part_offset, &part_size);
+            if (UNLIKELY(!bRet)) {
+                printf("Partition %s not found in parameter file\n", partition_name);
+                return false;
+            }
+        } else {
+            printf("No partition table found\n");
+            return false;
+        }
+    }
+    
+    FILE* backup_fp = fopen(backup_file, "wb");
+    if (!backup_fp) {
+        printf("Failed to create backup file: %s\n", backup_file);
+        return false;
+    }
+    
+    auto buffer = g_buffer_pool.acquire();
+    if (!buffer) {
+        printf("Failed to acquire buffer from pool\n");
+        fclose(backup_fp);
+        return false;
+    }
+    
+    u32 remaining = part_size;
+    u32 current_offset = part_offset;
+    
+    while (remaining) {
+        u32 to_read = remaining < CHUNK_SIZE ? remaining : CHUNK_SIZE;
+        if (!read_lba(dev, current_offset, to_read, buffer.get())) {
+            printf("Failed to read partition data at offset %u\n", current_offset);
+            fclose(backup_fp);
+            return false;
+        }
+        
+        size_t written = fwrite(buffer.get(), 1, to_read * SECTOR_SIZE, backup_fp);
+        if (written != to_read * SECTOR_SIZE) {
+            printf("Failed to write backup data\n");
+            fclose(backup_fp);
+            return false;
+        }
+        
+        remaining -= to_read;
+        current_offset += to_read;
+        
+        u32 completed = part_size - remaining;
+        printf("\rProgress: %u/%u sectors (%.1f%%)", 
+               completed, part_size, 
+               (completed * 100.0f) / part_size);
+    }
+    printf("\n");
+    
+    g_buffer_pool.release(std::move(buffer));
+    fclose(backup_fp);
+    printf("Backup completed successfully: %s\n", backup_file);
+    return true;
+}
+
+bool restore_partition(STRUCT_RKDEVICE_DESC &dev, const char* partition_name, const char* backup_file) {
+    PERF_MONITOR("restore_partition");
+    
+    u8 master_gpt[34 * SECTOR_SIZE], param_buffer[512 * SECTOR_SIZE];
+    u64 lba, lba_end;
+    u32 part_size, part_offset;
+    bool bRet;
+    
+    printf("Restoring partition: %s from %s\n", partition_name, backup_file);
+    
+    	FILE* backup_fp = fopen(backup_file, "rb");
+    if (!backup_fp) {
+        printf("Backup file not found: %s\n", backup_file);
+        return false;
+    }
+    
+    	fseek(backup_fp, 0, SEEK_END);
+    long file_size = ftell(backup_fp);
+    fseek(backup_fp, 0, SEEK_SET);
+    
+    if (file_size % SECTOR_SIZE != 0) {
+        printf("Invalid backup file size (not multiple of sector size)\n");
+        fclose(backup_fp);
+        return false;
+    }
+    
+    u32 backup_sectors = file_size / SECTOR_SIZE;
+    
+    	bRet = read_gpt(dev, master_gpt);
+    if (bRet) {
+        bRet = get_lba_from_gpt(master_gpt, partition_name, &lba, &lba_end);
+        if (bRet) {
+            part_size = (u32)(lba_end - lba + 1);
+            part_offset = (u32)lba;
+        } else {
+            printf("Partition %s not found in GPT\n", partition_name);
+            fclose(backup_fp);
+            return false;
+        }
+    } else {
+        bRet = read_param(dev, param_buffer);
+        if (bRet) {
+            bRet = get_lba_from_param(param_buffer+8, partition_name, &part_offset, &part_size);
+            if (!bRet) {
+                printf("Partition %s not found in parameter file\n", partition_name);
+                fclose(backup_fp);
+                return false;
+            }
+        } else {
+            printf("No partition table found\n");
+            fclose(backup_fp);
+            return false;
+        }
+    }
+    
+    	if (backup_sectors > part_size) {
+        printf("Warning: Backup is larger than partition (%u > %u sectors)\n", backup_sectors, part_size);
+        printf("Only first %u sectors will be restored\n", part_size);
+        backup_sectors = part_size;
+    } else if (backup_sectors < part_size) {
+        printf("Warning: Backup is smaller than partition (%u < %u sectors)\n", backup_sectors, part_size);
+        printf("Only %u sectors will be restored\n", backup_sectors);
+    }
+    
+    auto buffer = g_buffer_pool.acquire();
+    if (!buffer) {
+        printf("Failed to acquire buffer from pool\n");
+        fclose(backup_fp);
+        return false;
+    }
+    
+    u32 remaining = backup_sectors;
+    u32 current_offset = part_offset;
+    
+    while (remaining) {
+        u32 to_write = remaining < CHUNK_SIZE ? remaining : CHUNK_SIZE;
+        
+        size_t read = fread(buffer.get(), 1, to_write * SECTOR_SIZE, backup_fp);
+        if (read != to_write * SECTOR_SIZE) {
+            printf("Failed to read backup data\n");
+            fclose(backup_fp);
+            return false;
+        }
+        
+        if (!write_lba(dev, current_offset, buffer.get())) {
+            printf("Failed to write partition data at offset %u\n", current_offset);
+            fclose(backup_fp);
+            return false;
+        }
+        
+        remaining -= to_write;
+        current_offset += to_write;
+        
+        u32 completed = backup_sectors - remaining;
+        printf("\rProgress: %u/%u sectors (%.1f%%)", 
+               completed, backup_sectors, 
+               (completed * 100.0f) / backup_sectors);
+    }
+    printf("\n");
+    
+    g_buffer_pool.release(std::move(buffer));
+    fclose(backup_fp);
+    printf("Restore completed successfully\n");
+    return true;
+}
+
+bool list_backups(const char* backup_dir) {
+    DIR* dir = opendir(backup_dir);
+    if (!dir) {
+        printf("Backup directory not found: %s\n", backup_dir);
+        return false;
+    }
+    
+    printf("Available backups in %s:\n", backup_dir);
+    printf("%-30s %-15s %-20s\n", "Filename", "Size", "Date");
+    printf("------------------------------------------------------------\n");
+    
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_type == DT_REG) { // Regular file
+            char full_path[512];
+            snprintf(full_path, sizeof(full_path), "%s/%s", backup_dir, entry->d_name);
+            
+            struct stat st;
+            if (stat(full_path, &st) == 0) {
+                char size_str[16];
+                if (st.st_size > 1024*1024*1024) {
+                    snprintf(size_str, sizeof(size_str), "%.1f GB", st.st_size / (1024.0*1024.0*1024.0));
+                } else if (st.st_size > 1024*1024) {
+                    snprintf(size_str, sizeof(size_str), "%.1f MB", st.st_size / (1024.0*1024.0));
+                } else if (st.st_size > 1024) {
+                    snprintf(size_str, sizeof(size_str), "%.1f KB", st.st_size / 1024.0);
+                } else {
+                    snprintf(size_str, sizeof(size_str), "%ld B", st.st_size);
+                }
+                
+                char date_str[32];
+                strftime(date_str, sizeof(date_str), "%Y-%m-%d %H:%M:%S", localtime(&st.st_mtime));
+                
+                printf("%-30s %-15s %-20s\n", entry->d_name, size_str, date_str);
+            }
+        }
+    }
+    
+    	closedir(dir);
+	return true;
+}
+
+bool check_device_health(STRUCT_RKDEVICE_DESC &dev) {
+	printf("=== Device Health Check ===\n");
+	
+	printf("1. Device Connection: ");
+	if (dev.pUsbHandle) {
+		printf("OK\n");
+	} else {
+		printf("FAILED - No device handle\n");
+		return false;
+	}
+	
+	printf("2. Device Type: ");
+	switch (dev.emDeviceType) {
+		case RK27_DEVICE: printf("RK27\n"); break;
+		case RK28_DEVICE: printf("RK28\n"); break;
+		case RK29_DEVICE: printf("RK29\n"); break;
+		case RK30_DEVICE: printf("RK30\n"); break;
+		case RK31_DEVICE: printf("RK31\n"); break;
+		case RK32_DEVICE: printf("RK32\n"); break;
+		default: printf("Unknown (%d)\n", dev.emDeviceType); break;
+	}
+	
+	printf("3. USB Mode: ");
+	switch (dev.emUsbType) {
+		case RKUSB_MASKROM: printf("Maskrom Mode\n"); break;
+		case RKUSB_LOADER: printf("Loader Mode\n"); break;
+		case RKUSB_MSC: printf("Mass Storage Mode\n"); break;
+		default: printf("Unknown (%d)\n", dev.emUsbType); break;
+	}
+	
+	printf("4. Flash Information: ");
+	CRKDevice device(dev);
+	if (device.GetFlashInfo()) {
+		printf("OK\n");
+		printf("   - Flash Size: %u MB\n", device.m_flashInfo.uiFlashSize);
+		printf("   - Block Size: %u KB\n", device.m_flashInfo.usBlockSize);
+		printf("   - Page Size: %u KB\n", device.m_flashInfo.uiPageSize);
+		printf("   - Manufacturer: %s\n", device.m_flashInfo.szManufacturerName);
+	} else {
+		printf("FAILED - Cannot read flash info\n");
+	}
+	
+	printf("5. Communication Test: ");
+	if (device.TestDevice()) {
+		printf("OK\n");
+	} else {
+		printf("FAILED - Communication error\n");
+	}
+	
+	printf("=== Health Check Complete ===\n");
+	return true;
+}
+
+void print_device_status(STRUCT_RKDEVICE_DESC &dev) {
+	printf("Device Status:\n");
+	printf("  VID: 0x%04x\n", dev.usVid);
+	printf("  PID: 0x%04x\n", dev.usPid);
+	printf("  Location ID: 0x%08x\n", dev.uiLocationID);
+	printf("  USB Type: %d\n", dev.emUsbType);
+	printf("  Device Type: %d\n", dev.emDeviceType);
+}
+
+bool verify_flash_integrity(STRUCT_RKDEVICE_DESC &dev, u32 start_sector, u32 num_sectors) {
+	PERF_MONITOR("verify_flash_integrity");
+	
+	printf("Verifying flash integrity from sector %u to %u (%u sectors)\n", 
+	       start_sector, start_sector + num_sectors - 1, num_sectors);
+	
+	const u32 CHUNK_SIZE = 32;
+	const u32 BUFFER_SIZE = CHUNK_SIZE * SECTOR_SIZE;
+	
+	auto buffer1 = g_buffer_pool.acquire();
+	auto buffer2 = g_buffer_pool.acquire();
+	
+	if (!buffer1 || !buffer2) {
+		printf("Failed to acquire buffers from pool for integrity check\n");
+		return false;
+	}
+	
+	u32 errors = 0;
+	u32 sectors_checked = 0;
+	
+	for (u32 i = 0; i < num_sectors; i += CHUNK_SIZE) {
+		u32 current_chunk = (num_sectors - i) < CHUNK_SIZE ? (num_sectors - i) : CHUNK_SIZE;
+		u32 current_sector = start_sector + i;
+		
+		if (!read_lba(dev, current_sector, current_chunk, buffer1.get())) {
+			printf("Failed to read sectors %u-%u (first read)\n", current_sector, current_sector + current_chunk - 1);
+			++errors;
+			continue;
+		}
+		
+		if (!read_lba(dev, current_sector, current_chunk, buffer2.get())) {
+			printf("Failed to read sectors %u-%u (second read)\n", current_sector, current_sector + current_chunk - 1);
+			++errors;
+			continue;
+		}
+		
+		if (!fast_memcmp_optimized(buffer1.get(), buffer2.get(), current_chunk * SECTOR_SIZE)) {
+			printf("Integrity check failed for sectors %u-%u\n", current_sector, current_sector + current_chunk - 1);
+			++errors;
+		}
+		
+		sectors_checked += current_chunk;
+		
+		        printf("\rProgress: %u/%u sectors (%.1f%%) - Errors: %u",  
+		       sectors_checked, num_sectors, 
+		       (sectors_checked * 100.0f) / num_sectors, errors);
+	}
+	printf("\n");
+	
+	g_buffer_pool.release(std::move(buffer1));
+	g_buffer_pool.release(std::move(buffer2));
+	
+	if (!errors) {
+		printf("Flash integrity check PASSED - All %u sectors verified\n", sectors_checked);
+		return true;
+	} else {
+		printf("Flash integrity check FAILED - %u errors found\n", errors);
+		return false;
+	}
+}
+
+bool check_device_health(STRUCT_RKDEVICE_DESC &dev);
+void print_device_status(STRUCT_RKDEVICE_DESC &dev);
+bool verify_flash_integrity(STRUCT_RKDEVICE_DESC &dev, u32 start_sector, u32 num_sectors);
+
+bool execute_batch_script(STRUCT_RKDEVICE_DESC &dev, const char* script_file);
